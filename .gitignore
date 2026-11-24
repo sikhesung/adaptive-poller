@@ -1,4 +1,6 @@
 adaptive_server
 adaptive_bench
+test_poller
+test_poller_asan
 *.o
 .DS_Store

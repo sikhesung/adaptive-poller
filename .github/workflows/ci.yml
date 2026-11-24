@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+            run_asan: true
+          - os: ubuntu-latest
+            cc: clang
+            run_asan: true
+          - os: macos-latest
+            cc: clang
+            run_asan: false
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build all targets
+        run: make CC=${{ matrix.cc }} all
+
+      - name: Run unit tests
+        run: make CC=${{ matrix.cc }} test
+
+      - name: Run ASan + UBSan
+        if: matrix.run_asan
+        run: make CC=${{ matrix.cc }} asan
+
+      - name: Smoke test server
+        run: |
+          ./adaptive_server -p 18922 -m adaptive -c 64 &
+          SPID=$!
+          sleep 0.3
+          curl -sf http://127.0.0.1:18922/api/health | grep -q '"ok"'
+          curl -sf http://127.0.0.1:18922/api/stats | grep -q '"active_backend"'
+          kill -TERM $SPID
+          wait $SPID

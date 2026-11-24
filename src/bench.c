@@ -11,10 +11,10 @@
 #include <time.h>
 #include <unistd.h>
 
-static uint64_t now_us(void) {
+static uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
 static void set_nonblock(int fd) {
@@ -22,85 +22,26 @@ static void set_nonblock(int fd) {
     if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-/* Unit tests: verify poll, epoll, auto, and adaptive hysteresis */
-static void run_unit_tests(void) {
-    poller_mode_t modes[] = { POLLER_POLL, POLLER_EPOLL, POLLER_AUTO, POLLER_ADAPTIVE };
-    for (size_t m = 0; m < 4; m++) {
-        poller_t *p = poller_create(modes[m], 128);
-        assert(p != NULL);
-        int sp[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
-        set_nonblock(sp[0]);
-        set_nonblock(sp[1]);
-
-        assert(poller_add(p, sp[0], POLLER_IN, (void *)(uintptr_t)42) == 0);
-        char msg = 'x';
-        assert(write(sp[1], &msg, 1) == 1);
-
-        poller_event_t ev[4];
-        int n = poller_wait(p, ev, 4, 100);
-        assert(n == 1);
-        assert(ev[0].fd == sp[0]);
-        assert((ev[0].events & POLLER_IN) != 0);
-        assert((uintptr_t)ev[0].udata == 42);
-
-        char got = 0;
-        assert(read(sp[0], &got, 1) == 1 && got == 'x');
-        assert(poller_mod(p, sp[0], POLLER_IN | POLLER_OUT, (void *)(uintptr_t)99) == 0);
-        assert(poller_del(p, sp[0]) == 0);
-
-        close(sp[0]);
-        close(sp[1]);
-        poller_destroy(p);
-    }
-
-    /* Verify POLLER_AUTO zero-cost selection */
-    poller_t *p_small = poller_create(POLLER_AUTO, 64);
-    poller_t *p_large = poller_create(POLLER_AUTO, 2048);
-    poller_stats_t s1, s2;
-    poller_get_stats(p_small, &s1);
-    poller_get_stats(p_large, &s2);
-    assert(s1.using_epoll == 0 && s1.switches == 0);
-#ifdef __linux__
-    assert(s2.using_epoll == 1 && s2.switches == 0);
-#endif
-    poller_destroy(p_small);
-    poller_destroy(p_large);
-
-    /* Verify POLLER_ADAPTIVE hysteresis promotion (>= 256) without thrashing */
-    poller_t *pa = poller_create(POLLER_ADAPTIVE, 64);
-    int fds[300][2];
-    for (int i = 0; i < 300; i++) {
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds[i]) == 0);
-        assert(poller_add(pa, fds[i][0], POLLER_IN, NULL) == 0);
-    }
-    poller_stats_t sa;
-    poller_get_stats(pa, &sa);
-#ifdef __linux__
-    assert(sa.using_epoll == 1);
-    assert(sa.switches == 1);
-#endif
-    /* Drop to 200 fds (still above LOW_WATER=64) -> must NOT thrash back to poll */
-    for (int i = 200; i < 300; i++) {
-        assert(poller_del(pa, fds[i][0]) == 0);
-        close(fds[i][0]);
-        close(fds[i][1]);
-    }
-    poller_get_stats(pa, &sa);
-#ifdef __linux__
-    assert(sa.using_epoll == 1);
-    assert(sa.switches == 1);
-#endif
-    for (int i = 0; i < 200; i++) {
-        assert(poller_del(pa, fds[i][0]) == 0);
-        close(fds[i][0]);
-        close(fds[i][1]);
-    }
-    poller_destroy(pa);
-    printf("[OK] All unit tests passed (poll / epoll / auto / adaptive hysteresis).\n");
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a;
+    uint64_t y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
 }
 
-/* Workload A: Small N=32 with heavy add/mod/del churn */
+static void print_row(const char *mode, const poller_stats_t *st,
+                      double total_ms, uint64_t *lats_ns, int iters) {
+    qsort(lats_ns, (size_t)iters, sizeof(uint64_t), cmp_u64);
+    double p50 = (double)lats_ns[(size_t)(iters * 0.50)] / 1000.0;
+    double p99 = (double)lats_ns[(size_t)(iters * 0.99)] / 1000.0;
+    double ops = (double)iters / (total_ms / 1000.0);
+    printf("  %-8s | %-6s | %7.2f ms | %9.0f op/s | p50=%5.1fus | p99=%6.1fus | ctl=%5llu (elided=%4llu) | sw=%llu\n",
+           mode, st->active_backend, total_ms, ops, p50, p99,
+           (unsigned long long)st->ctl_calls,
+           (unsigned long long)st->ctl_elided,
+           (unsigned long long)st->switches);
+}
+
+/* Workload A: Small N=32 + Frequent interest toggling & redundant mod calls */
 static void bench_churn(poller_mode_t mode) {
     const int N = 32;
     const int ITERS = 10000;
@@ -113,12 +54,15 @@ static void bench_churn(poller_mode_t mode) {
         assert(poller_add(p, sp[i][0], POLLER_IN, NULL) == 0);
     }
 
+    uint64_t *lats = malloc((size_t)ITERS * sizeof(uint64_t));
     poller_event_t ev[32];
-    uint64_t t0 = now_us();
+    uint64_t t_all = now_ns();
     for (int it = 0; it < ITERS; it++) {
+        uint64_t t0 = now_ns();
         int idx = it % N;
-        /* Simulate frequent interest toggling (IN <-> IN|OUT) */
-        poller_mod(p, sp[idx][0], (it & 1) ? (POLLER_IN | POLLER_OUT) : POLLER_IN, NULL);
+        /* Alternate genuine toggle & redundant re-arm to exercise elision */
+        uint32_t mask = ((it / 2) & 1) ? (POLLER_IN | POLLER_OUT) : POLLER_IN;
+        poller_mod(p, sp[idx][0], mask, NULL);
         char b = 'a';
         ssize_t w = write(sp[idx][1], &b, 1);
         (void)w;
@@ -128,17 +72,15 @@ static void bench_churn(poller_mode_t mode) {
             ssize_t r = read(ev[j].fd, tmp, sizeof(tmp));
             (void)r;
         }
+        lats[it] = now_ns() - t0;
     }
-    uint64_t dt = now_us() - t0;
+    double total_ms = (double)(now_ns() - t_all) / 1000000.0;
 
     poller_stats_t st;
     poller_get_stats(p, &st);
-    printf("  %-9s | backend=%-5s | %6.2f ms | epoll_ctl=%6llu | switches=%llu\n",
-           poller_mode_name(mode), st.using_epoll ? "epoll" : "poll",
-           (double)dt / 1000.0,
-           (unsigned long long)st.epoll_ctl_calls,
-           (unsigned long long)st.switches);
+    print_row(poller_mode_name(mode), &st, total_ms, lats, ITERS);
 
+    free(lats);
     for (int i = 0; i < N; i++) {
         poller_del(p, sp[i][0]);
         close(sp[i][0]);
@@ -147,14 +89,15 @@ static void bench_churn(poller_mode_t mode) {
     poller_destroy(p);
 }
 
-/* Workload B: C10K-style 2,000 mostly-idle sockets + 8 active sockets */
+/* Workload B: Large N=2,000 Idle Keep-Alive + 8 Active */
 static void bench_idle_scale(poller_mode_t mode) {
     const int N = 2000;
     const int ACTIVE = 8;
     const int ITERS = 4000;
     poller_t *p = poller_create(mode, N);
     int (*sp)[2] = malloc((size_t)N * sizeof(int[2]));
-    assert(sp != NULL);
+    uint64_t *lats = malloc((size_t)ITERS * sizeof(uint64_t));
+    assert(sp && lats);
 
     for (int i = 0; i < N; i++) {
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp[i]) == 0);
@@ -164,8 +107,9 @@ static void bench_idle_scale(poller_mode_t mode) {
     }
 
     poller_event_t ev[32];
-    uint64_t t0 = now_us();
+    uint64_t t_all = now_ns();
     for (int it = 0; it < ITERS; it++) {
+        uint64_t t0 = now_ns();
         int idx = it % ACTIVE;
         char b = 'z';
         ssize_t w = write(sp[idx][1], &b, 1);
@@ -176,17 +120,15 @@ static void bench_idle_scale(poller_mode_t mode) {
             ssize_t r = read(ev[j].fd, tmp, sizeof(tmp));
             (void)r;
         }
+        lats[it] = now_ns() - t0;
     }
-    uint64_t dt = now_us() - t0;
+    double total_ms = (double)(now_ns() - t_all) / 1000000.0;
 
     poller_stats_t st;
     poller_get_stats(p, &st);
-    printf("  %-9s | backend=%-5s | %6.2f ms | epoll_ctl=%6llu | switches=%llu\n",
-           poller_mode_name(mode), st.using_epoll ? "epoll" : "poll",
-           (double)dt / 1000.0,
-           (unsigned long long)st.epoll_ctl_calls,
-           (unsigned long long)st.switches);
+    print_row(poller_mode_name(mode), &st, total_ms, lats, ITERS);
 
+    free(lats);
     for (int i = 0; i < N; i++) {
         poller_del(p, sp[i][0]);
         close(sp[i][0]);
@@ -196,23 +138,108 @@ static void bench_idle_scale(poller_mode_t mode) {
     poller_destroy(p);
 }
 
-int main(int argc, char **argv) {
-    if (argc > 1 && strcmp(argv[1], "--test") == 0) {
-        run_unit_tests();
-        return 0;
+/* Workload C: Traffic Spike (24 -> 600 -> 24 fds) measuring adaptive stability */
+static void bench_spike(poller_mode_t mode) {
+    const int BASE = 24;
+    const int PEAK = 600;
+    const int PHASE_ITERS = 1500;
+    const int TOTAL = PHASE_ITERS * 3;
+    poller_t *p = poller_create(mode, BASE);
+    int (*sp)[2] = malloc((size_t)PEAK * sizeof(int[2]));
+    uint64_t *lats = malloc((size_t)TOTAL * sizeof(uint64_t));
+    assert(sp && lats);
+
+    for (int i = 0; i < BASE; i++) {
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp[i]) == 0);
+        set_nonblock(sp[i][0]);
+        set_nonblock(sp[i][1]);
+        assert(poller_add(p, sp[i][0], POLLER_IN, NULL) == 0);
     }
 
-    run_unit_tests();
-    printf("\n=== Workload A: Small N=32 + Frequent State Churn (10,000 iters) ===\n");
+    poller_event_t ev[32];
+    int k = 0;
+    uint64_t t_all = now_ns();
+
+    /* Phase 1: Small traffic (24 fds) */
+    for (int it = 0; it < PHASE_ITERS; it++, k++) {
+        uint64_t t0 = now_ns();
+        int idx = it % 4;
+        char b = '1';
+        ssize_t w = write(sp[idx][1], &b, 1); (void)w;
+        int n = poller_wait(p, ev, 32, 10);
+        for (int j = 0; j < n; j++) { char t[8]; ssize_t r = read(ev[j].fd, t, sizeof(t)); (void)r; }
+        lats[k] = now_ns() - t0;
+    }
+
+    /* Spike up to 600 fds */
+    for (int i = BASE; i < PEAK; i++) {
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp[i]) == 0);
+        set_nonblock(sp[i][0]);
+        set_nonblock(sp[i][1]);
+        assert(poller_add(p, sp[i][0], POLLER_IN, NULL) == 0);
+    }
+
+    /* Phase 2: Peak traffic (600 fds) */
+    for (int it = 0; it < PHASE_ITERS; it++, k++) {
+        uint64_t t0 = now_ns();
+        int idx = it % 4;
+        char b = '2';
+        ssize_t w = write(sp[idx][1], &b, 1); (void)w;
+        int n = poller_wait(p, ev, 32, 10);
+        for (int j = 0; j < n; j++) { char t[8]; ssize_t r = read(ev[j].fd, t, sizeof(t)); (void)r; }
+        lats[k] = now_ns() - t0;
+    }
+
+    /* Drop back to 24 fds */
+    for (int i = BASE; i < PEAK; i++) {
+        poller_del(p, sp[i][0]);
+        close(sp[i][0]);
+        close(sp[i][1]);
+    }
+
+    /* Phase 3: Post-spike calm (24 fds) */
+    for (int it = 0; it < PHASE_ITERS; it++, k++) {
+        uint64_t t0 = now_ns();
+        int idx = it % 4;
+        char b = '3';
+        ssize_t w = write(sp[idx][1], &b, 1); (void)w;
+        int n = poller_wait(p, ev, 32, 10);
+        for (int j = 0; j < n; j++) { char t[8]; ssize_t r = read(ev[j].fd, t, sizeof(t)); (void)r; }
+        lats[k] = now_ns() - t0;
+    }
+
+    double total_ms = (double)(now_ns() - t_all) / 1000000.0;
+    poller_stats_t st;
+    poller_get_stats(p, &st);
+    print_row(poller_mode_name(mode), &st, total_ms, lats, TOTAL);
+
+    free(lats);
+    for (int i = 0; i < BASE; i++) {
+        poller_del(p, sp[i][0]);
+        close(sp[i][0]);
+        close(sp[i][1]);
+    }
+    free(sp);
+    poller_destroy(p);
+}
+
+int main(void) {
+    printf("=== Workload A: Small N=32 + Frequent Churn & Redundant Mod (10,000 iters) ===\n");
     bench_churn(POLLER_POLL);
-    bench_churn(POLLER_EPOLL);
+    bench_churn(POLLER_FAST);
     bench_churn(POLLER_AUTO);
     bench_churn(POLLER_ADAPTIVE);
 
-    printf("\n=== Workload B: Large N=2,000 Idle Sockets + 8 Active (4,000 iters) ===\n");
+    printf("\n=== Workload B: Large N=2,000 Idle Keep-Alive + 8 Active (4,000 iters) ===\n");
     bench_idle_scale(POLLER_POLL);
-    bench_idle_scale(POLLER_EPOLL);
+    bench_idle_scale(POLLER_FAST);
     bench_idle_scale(POLLER_AUTO);
     bench_idle_scale(POLLER_ADAPTIVE);
+
+    printf("\n=== Workload C: Dynamic Traffic Spike 24 -> 600 -> 24 fds (4,500 iters) ===\n");
+    bench_spike(POLLER_POLL);
+    bench_spike(POLLER_FAST);
+    bench_spike(POLLER_AUTO);
+    bench_spike(POLLER_ADAPTIVE);
     return 0;
 }
